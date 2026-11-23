@@ -29,6 +29,7 @@ include = [
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [workspace]
+exclude = ["vendor"]
 members = ["camilladsp-schema"]
 
 # Both crates are released in lockstep with the same version.
@@ -176,3 +177,6 @@ codegen-units = 16
 inherits = "release-fast"
 debug-assertions = true
 overflow-checks = true
+
+[patch.crates-io]
+crossbeam-utils = { path = "vendor/crossbeam-utils" }
