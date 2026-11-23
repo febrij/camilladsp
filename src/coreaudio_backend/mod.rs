@@ -15,3 +15,4 @@
 // <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
 
 pub mod device;
+pub mod duplex;
