@@ -143,6 +143,40 @@ pub fn start_pipeline(
     let (tx_pipeconf, rx_pipeconf) = crossbeam_channel::unbounded();
     let barrier = Arc::new(Barrier::new(4));
 
+    // FJC patch (8): capture, processing and playback in the IO callback of one audio unit.
+    #[cfg(target_os = "macos")]
+    if crate::coreaudio_backend::duplex::wanted(active_config) {
+        let barrier = Arc::new(Barrier::new(2));
+        let used_channels = config::used_capture_channels(active_config);
+        {
+            let mut capture_status = status_structs.capture.write();
+            crate::update_capture_state(&mut capture_status, ProcessingState::Starting);
+            capture_status.used_channels = Arc::new(ChannelMask::new(&used_channels));
+        }
+        let cap_handle = crate::coreaudio_backend::duplex::start(
+            active_config.clone(),
+            barrier.clone(),
+            tx_status,
+            rx_command_cap,
+            rx_pipeconf,
+            status_structs.capture.clone(),
+            status_structs.playback.clone(),
+            status_structs.processing.clone(),
+        );
+        let pipeline = EnginePipeline {
+            tx_command_cap,
+            tx_pipeconf,
+            barrier,
+            // The duplex thread stands in for the capture thread, and there is no playback thread.
+            pb_handle: Box::new(thread::spawn(|| {})),
+            cap_handle,
+            pb_ready: false,
+            cap_ready: false,
+            capture_status: status_structs.capture.clone(),
+        };
+        return (pipeline, rx_status);
+    }
+
     // Processing thread
     processing::run_processing(
         active_config.clone(),
