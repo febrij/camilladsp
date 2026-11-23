@@ -688,6 +688,7 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                 let (tx_dev, rx_dev) = bounded(channel_capacity);
                 let buffer_fill = Arc::new(Mutex::new(countertimer::DeviceBufferEstimator::new(samplerate, chunksize)));
                 let buffer_fill_clone = buffer_fill.clone();
+                let mut fjc_tp: Option<crate::fjc_medidas::TruePeak> = None;
                 let mut chunk_stats = ChunkStats {
                     rms: vec![0.0; channels],
                     peak: vec![0.0; channels],
@@ -927,6 +928,9 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                                 status_channel.send(StatusMessage::SetSpeed(speed)).unwrap_or(());
                             }
                             chunk.update_stats(&mut chunk_stats);
+                            fjc_tp
+                                .get_or_insert_with(|| crate::fjc_medidas::TruePeak::new(chunk.channels, chunk.frames))
+                                .update(&chunk, &mut chunk_stats);
                             crate::push_playback_audio_buffer(&playback_status, &chunk);
                             conversion_result = chunk_to_buffer_rawbytes(
                                 chunk,

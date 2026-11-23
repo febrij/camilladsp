@@ -1866,6 +1866,10 @@ fn handle_command(
                 value: load,
             })
         }
+        WsCommand::GetProcessorLevels {} => Some(WsReply::GetProcessorLevels {
+            result: WsResult::Ok,
+            value: crate::fjc_medidas::read(),
+        }),
         WsCommand::GetResamplerLoad {} => {
             let load = shared_data_inst.processing_params.resampler_load();
             Some(WsReply::GetResamplerLoad {
