@@ -530,6 +530,12 @@ ws_protocol! {
             value: f32,
         },
 
+        /// FJC patch (11): detector level and gain reduction of every compressor since the last call.
+        GetProcessorLevels -> {
+            /// Compressor name to [highest detector level dB, deepest gain reduction dB (<= 0), threshold dB].
+            value: std::collections::BTreeMap<String, Vec<f32>>,
+        },
+
         /// Get the current resampler processing load.
         GetResamplerLoad -> {
             /// Resampler processing load in percent.

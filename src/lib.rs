@@ -114,6 +114,7 @@ pub mod engine_pipeline;
 pub mod engine_process_signals;
 /// Fader ramps, advanced once per chunk and read by the Volume and Loudness filters.
 pub mod fader;
+pub mod fjc_medidas;
 /// File, stdin/stdout, and WAV audio backends.
 pub mod file_backend;
 /// Audio filter implementations and the [`filters::Filter`] trait.

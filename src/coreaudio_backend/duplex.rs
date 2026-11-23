@@ -327,6 +327,7 @@ fn run(
         };
         let (mut rms_in, mut peak_in) = (Vec::with_capacity(in_channels), Vec::with_capacity(in_channels));
         let (mut rms_out, mut peak_out) = (Vec::with_capacity(out_channels), Vec::with_capacity(out_channels));
+        let mut fjc_tp = crate::fjc_medidas::TruePeak::new(out_channels, chunksize);
         let mut running = false;
         let mut previous: Option<Instant> = None;
         let mut previous_sample_time: Option<f64> = None;
@@ -434,6 +435,7 @@ fn run(
             chunk = pipeline.process_chunk(chunk);
 
             chunk.update_stats(&mut stats_out);
+            fjc_tp.update(&chunk, &mut stats_out);
             crate::push_playback_audio_buffer(&playback_status, &chunk);
             let (_, clipped) = chunk_to_buffer_rawbytes(chunk, out, &BinarySampleFormat::F32_LE);
             crate::update_playback_signal_status(

@@ -41,6 +41,7 @@ pub struct Compressor {
     pub samplerate: usize,
     pub scratch: Vec<CamillaFloat>,
     pub prev_loudness: CamillaFloat,
+    pub fjc: std::sync::Arc<crate::fjc_medidas::Measure>,
 }
 
 impl Compressor {
@@ -52,6 +53,7 @@ impl Compressor {
         chunksize: usize,
     ) -> Self {
         let name = name.to_string();
+        let fjc = crate::fjc_medidas::register(&name);
         let channels = config.channels;
         let mut monitor_channels = config.monitor_channels();
         if monitor_channels.is_empty() {
@@ -112,6 +114,7 @@ impl Compressor {
             samplerate,
             scratch,
             prev_loudness: -100.0,
+            fjc,
         }
     }
 
@@ -175,6 +178,8 @@ impl Processor for Compressor {
     fn process_chunk(&mut self, input: &mut AudioChunk) {
         self.sum_monitor_channels(input);
         self.estimate_loudness();
+        let fjc_level = self.scratch.iter().fold(-1000.0, |a: CamillaFloat, v| if *v > a { *v } else { a });
+        self.fjc.record(fjc_level as f32, self.threshold as f32, self.factor as f32);
         self.calculate_linear_gain();
         for ch in self.process_channels.iter() {
             self.apply_gain(&mut input.waveforms[*ch]);

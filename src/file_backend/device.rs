@@ -266,10 +266,14 @@ impl PlaybackDevice for FilePlaybackDevice {
                         // file) keeps its u32::MAX placeholder sizes, so it can run past 4 GB
                         // and be read to EOF.
                         let capped = matches!(sink, PlaybackSink::SeekableWav(_)) && !use_rf64;
+                        let mut fjc_tp: Option<crate::fjc_medidas::TruePeak> = None;
                         let playback_error = loop {
                             match channel.recv() {
                                 Ok(AudioMessage::Audio(chunk)) => {
                                     chunk.update_stats(&mut chunk_stats);
+                                    fjc_tp
+                                        .get_or_insert_with(|| crate::fjc_medidas::TruePeak::new(chunk.channels, chunk.frames))
+                                        .update(&chunk, &mut chunk_stats);
                                     crate::push_playback_audio_buffer(&playback_status, &chunk);
                                     let (valid_bytes, nbr_clipped) = chunk_to_buffer_rawbytes(
                                         chunk,
