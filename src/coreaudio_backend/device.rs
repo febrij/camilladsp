@@ -34,6 +34,7 @@ use std::mem;
 use std::os::raw::c_void;
 use std::ptr::{NonNull, null, null_mut};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -54,7 +55,8 @@ use libc::pid_t;
 use objc2_audio_toolbox::{kAudioCodecUnknownPropertyError, kAudioUnitProperty_StreamFormat};
 use objc2_core_audio::{
     AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-    AudioObjectPropertyAddress, AudioObjectSetPropertyData, kAudioDevicePropertyClockSource,
+    AudioObjectPropertyAddress, AudioObjectSetPropertyData, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyClockSource,
     kAudioDevicePropertyClockSourceNameForIDCFString, kAudioDevicePropertyClockSources,
     kAudioDevicePropertyStereoPan, kAudioDevicePropertyStreamConfiguration, kAudioHardwareNoError,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyElementWildcard,
@@ -342,6 +344,145 @@ fn capabilities_from_map(map: CapabilitiesMap) -> Vec<crate::ChannelCapability> 
     capabilities
 }
 
+/// FJC patch (1): ask CoreAudio for the device IO buffer size used by this process.
+/// Stock CamillaDSP leaves the default (512 frames each way), which sets the latency floor.
+/// Rule: if chunksize < 512, request chunksize frames. The CAMILLADSP_COREAUDIO_BUFFER
+/// environment variable (frames) overrides the rule. Otherwise nothing is changed.
+/// When the rule is active for the playback device, its audio workgroup is stored so that
+/// the helper threads can join it (2).
+fn set_io_buffer_frames(device_id: AudioDeviceID, chunksize: usize, what: &str) {
+    let wanted: u32 = match std::env::var("CAMILLADSP_COREAUDIO_BUFFER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(frames) if frames > 0 => frames,
+        _ => {
+            if chunksize < 512 {
+                chunksize as u32
+            } else {
+                if what == "playback" {
+                    DEVICE_WORKGROUP.store(0, Ordering::SeqCst);
+                }
+                return;
+            }
+        }
+    };
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyBufferFrameSize,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let data_size = mem::size_of::<u32>() as u32;
+    let status_set = unsafe {
+        AudioObjectSetPropertyData(
+            device_id,
+            NonNull::from(&property_address),
+            0,
+            null(),
+            data_size,
+            NonNull::from(&wanted).cast(),
+        )
+    };
+    let mut actual: u32 = 0;
+    let status_get = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&property_address),
+            0,
+            null(),
+            NonNull::from(&data_size),
+            NonNull::from(&mut actual).cast(),
+        )
+    };
+    info!(
+        "FJC patch: {what} device IO buffer: requested {wanted} frames (status {status_set}), device reports {actual} frames (status {status_get})."
+    );
+    if what == "playback" {
+        store_device_workgroup(device_id);
+    }
+}
+
+/// FJC patch (2): the audio workgroup of the playback device. On Apple Silicon, realtime
+/// helper threads that are not part of the device workgroup get stalled now and then.
+#[repr(C)]
+pub struct OsWorkgroupJoinToken {
+    sig: u32,
+    opaque: [u8; 36],
+}
+
+unsafe extern "C" {
+    fn os_workgroup_join(wg: *mut c_void, token_out: *mut OsWorkgroupJoinToken) -> i32;
+    fn os_workgroup_leave(wg: *mut c_void, token: *mut OsWorkgroupJoinToken);
+}
+
+static DEVICE_WORKGROUP: AtomicUsize = AtomicUsize::new(0);
+
+/// Leaves the workgroup when dropped (on the thread that joined, before it exits).
+pub struct WorkgroupMembership {
+    wg: *mut c_void,
+    token: OsWorkgroupJoinToken,
+}
+
+impl Drop for WorkgroupMembership {
+    fn drop(&mut self) {
+        unsafe { os_workgroup_leave(self.wg, &mut self.token) };
+    }
+}
+
+fn store_device_workgroup(device_id: AudioDeviceID) {
+    if std::env::var("CAMILLADSP_NO_WORKGROUP").is_ok() {
+        DEVICE_WORKGROUP.store(0, Ordering::SeqCst);
+        info!("FJC patch: audio workgroup disabled by CAMILLADSP_NO_WORKGROUP.");
+        return;
+    }
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: 0x6f73_7767, // kAudioDevicePropertyIOThreadOSWorkgroup, 'oswg'
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let data_size = mem::size_of::<*mut c_void>() as u32;
+    let mut wg: *mut c_void = null_mut();
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&property_address),
+            0,
+            null(),
+            NonNull::from(&data_size),
+            NonNull::from(&mut wg).cast(),
+        )
+    };
+    if status != 0 || wg.is_null() {
+        warn!("FJC patch: could not get the device audio workgroup, status {status}.");
+        DEVICE_WORKGROUP.store(0, Ordering::SeqCst);
+        return;
+    }
+    DEVICE_WORKGROUP.store(wg as usize, Ordering::SeqCst);
+}
+
+/// Join the calling thread to the stored device workgroup, if any.
+pub fn join_device_workgroup(what: &str) -> Option<WorkgroupMembership> {
+    let wg = DEVICE_WORKGROUP.load(Ordering::SeqCst) as *mut c_void;
+    if wg.is_null() {
+        return None;
+    }
+    let mut membership = WorkgroupMembership {
+        wg,
+        token: OsWorkgroupJoinToken {
+            sig: 0,
+            opaque: [0; 36],
+        },
+    };
+    let res = unsafe { os_workgroup_join(wg, &mut membership.token) };
+    if res != 0 {
+        warn!("FJC patch: {what} thread could not join the device audio workgroup, error {res}.");
+        mem::forget(membership);
+        return None;
+    }
+    info!("FJC patch: {what} thread joined the device audio workgroup.");
+    Some(membership)
+}
+
 fn open_coreaudio_playback(
     devname: &Option<String>,
     samplerate: usize,
@@ -581,11 +722,15 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                         return;
                     }
                 };
+                set_io_buffer_frames(device_id, chunksize, "playback");
 
                 type Args = render_callback::Args<data::InterleavedBytes<f32>>;
 
                 let mut running = false;
                 let mut starting = true;
+                let keep_start_backlog = std::env::var("CAMILLADSP_KEEP_START_BACKLOG").is_ok();
+                let no_resync = std::env::var("CAMILLADSP_NO_RESYNC").is_ok();
+                let mut excess_callbacks: usize = 0;
 
                 let callback_res = audio_unit.set_render_callback(move |args: Args| {
                     let Args {
@@ -595,18 +740,34 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                     while sample_queue.len() < (blockalign * num_frames) {
                         trace!("playback loop needs more samples, reading from channel");
                         match rx_dev.try_recv() {
-                            Ok(PlaybackDeviceMessage::Data(bytes)) => {
+                            Ok(PlaybackDeviceMessage::Data(mut bytes)) => {
                                 trace!("Received a chunk.");
                                 if !running {
                                     running = true;
+                                    // FJC patch (3): after an underrun, discount the chunks already
+                                    // waiting, so the cushion goes back to target_level instead of growing.
+                                    let mut silent_frames = target_level;
                                     if starting {
                                         starting = false;
+                                        // FJC patch (4): at start, drop the chunks that piled up before this
+                                        // callback began (the capture device may start a few buffers earlier).
+                                        // Without rate adjust nothing ever drains them: they stay as latency.
+                                        if !keep_start_backlog {
+                                            let mut dropped = 0;
+                                            while let Ok(PlaybackDeviceMessage::Data(newer)) = rx_dev.try_recv() {
+                                                for _ in device_consumer.pop_iter().take(bytes) {}
+                                                bytes = newer;
+                                                dropped += 1;
+                                            }
+                                            info!("FJC patch: playback start, dropped {dropped} backlog chunks.");
+                                        }
                                     }
                                     else {
+                                        silent_frames = target_level.saturating_sub(rx_dev.len() * chunksize);
                                         info!("Restarting playback after buffer underrun.");
                                     }
-                                    debug!("Inserting {target_level} silent frames to reach target delay.");
-                                    sample_queue.resize(sample_queue.len() + blockalign * target_level, 0);
+                                    debug!("Inserting {silent_frames} silent frames to reach target delay.");
+                                    sample_queue.resize(sample_queue.len() + blockalign * silent_frames, 0);
                                 }
                                 append_from_ringbuffer(&mut device_consumer, &mut sample_queue, bytes);
                             }
@@ -628,6 +789,44 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                     sample_queue.drain(..nbr_bytes);
                     let curr_buffer_fill =
                         sample_queue.len() / blockalign + rx_dev.len() * chunksize;
+                    // FJC patch (5): without rate adjust nothing drains what piles up behind an
+                    // underrun (the capture side keeps recording during the stall), so every
+                    // dropout would add its length to the latency for good. If the buffer stays
+                    // above target for 20 ms, skip the excess chunks and go back to target.
+                    if !adjust && !no_resync && running {
+                        // When every callback takes exactly one chunk the level does not
+                        // fluctuate, so one whole chunk above target is already excess.
+                        let regular = num_frames == chunksize;
+                        let ceiling = if regular {
+                            target_level + chunksize - 1
+                        } else {
+                            target_level + 2 * chunksize.max(num_frames)
+                        };
+                        if curr_buffer_fill > ceiling {
+                            excess_callbacks += 1;
+                        } else {
+                            excess_callbacks = 0;
+                        }
+                        if excess_callbacks * num_frames > samplerate / 50 {
+                            let keep = if regular {
+                                target_level + chunksize - 1
+                            } else {
+                                target_level + chunksize
+                            };
+                            let mut dropped = 0;
+                            while rx_dev.len() * chunksize + sample_queue.len() / blockalign > keep {
+                                match rx_dev.try_recv() {
+                                    Ok(PlaybackDeviceMessage::Data(bytes)) => {
+                                        for _ in device_consumer.pop_iter().take(bytes) {}
+                                        dropped += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            excess_callbacks = 0;
+                            warn!("FJC patch: playback resync, dropped {dropped} chunks.");
+                        }
+                    }
                     if let Some(mut estimator) = buffer_fill_clone.try_lock() {
                         estimator.add(curr_buffer_fill)
                     }
@@ -681,6 +880,7 @@ impl PlaybackDevice for CoreaudioPlaybackDevice {
                         return;
                     }
                 }
+                let _fjc_workgroup = join_device_workgroup("playback");
                 let thread_handle =
                 match promote_current_thread_to_real_time(chunksize as u32, samplerate as u32) {
                     Ok(h) => {
@@ -879,6 +1079,7 @@ impl CaptureDevice for CoreaudioCaptureDevice {
                         return;
                     }
                 };
+                set_io_buffer_frames(device_id, chunksize, "capture");
 
                 let mut chunk_counter = 0;
                 let mut ring_full = false;
@@ -950,6 +1151,11 @@ impl CaptureDevice for CoreaudioCaptureDevice {
                 // adjust is going to write them.
                 let pitch_supported = enable_rate_adjust && configure_pitch_control(device_id);
                 if pitch_supported {
+                    // FJC patch (9): start every session at the nominal speed. The pitch belongs to the
+                    // device and outlives the session: left off-centre by an earlier one, the buffer
+                    // drains faster than rate adjust can catch up and it underruns again and again.
+                    set_pitch(device_id, 1.0);
+                    info!("FJC patch: capture device pitch reset to 1.0.");
                     if samplerate == capture_samplerate && resampler.is_some() {
                         warn!("Needless 1:1 sample rate conversion active. Not needed since capture device supports rate adjust.");
                     } else if async_src && resampler.is_some() {
@@ -992,6 +1198,7 @@ impl CaptureDevice for CoreaudioCaptureDevice {
                         return;
                     },
                 }
+                let _fjc_workgroup = join_device_workgroup("capture");
                 let thread_handle = match promote_current_thread_to_real_time(chunksize as u32, samplerate as u32) {
                     Ok(h) => {
                         debug!("Capture thread has real-time priority.");

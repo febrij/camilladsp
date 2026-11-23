@@ -133,6 +133,10 @@ fn processing(
         };
 
     barrier_proc.wait();
+    // FJC patch (2): the playback device is open by now.
+    #[cfg(target_os = "macos")]
+    let _fjc_workgroup =
+        crate::coreaudio_backend::device::join_device_workgroup("processing");
     debug!("Processing loop starts now!");
     loop {
         match rx_cap.recv() {
